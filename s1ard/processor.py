@@ -1,4 +1,4 @@
-import os
+﻿import os
 import time
 import shutil
 import inspect
@@ -9,6 +9,14 @@ from pyroSAR import identify, identify_many, Archive
 from s1ard.config import get_config, gdal_conf
 from s1ard.ancillary import set_logging
 from s1ard import ard, ocn, search
+from s1ard.archive_utils import archive_insert_safely
+from s1ard.pyrosar_compat import enable_pyrosar_cogsafe_compat
+from s1ard.custom_dem import prepare_custom_geoid_model, prepare_custom_dem
+from s1ard.sar_state import expected_sar_epsgs, sar_outputs_complete
+from s1ard.custom_grid import (load_custom_tiles, union_extent,
+                               union_geometry, reproject_geometry,
+                               scene_extent_in_grid,
+                               filter_tiles_by_scenes, scene_intersects_tile)
 from cesard import dem
 import cesard.tile_extraction as tile_ex
 from cesard.search import scene_select
@@ -18,6 +26,7 @@ from cesard.ancillary import (buffer_time, check_scene_consistency,
 from s1ard.processors.registry import load_processor
 
 gdal.UseExceptions()
+
 
 
 def main(config_file=None, debug=False, **kwargs):
@@ -37,6 +46,7 @@ def main(config_file=None, debug=False, **kwargs):
     config = get_config(config_file=config_file, **kwargs)
     log = set_logging(config=config, debug=debug)
     config_proc = config['processing']
+    enable_pyrosar_cogsafe_compat(log=log)
     processor_name = config_proc['processor']
     processor = load_processor(processor_name)
     config_sar = config[processor_name]
@@ -45,16 +55,81 @@ def main(config_file=None, debug=False, **kwargs):
     spacings = {am: config_proc[f'spacing_{am.lower()}']
                 for am in ['IW', 'SM', 'EW']}
     config_sar['spacing'] = spacings[config_proc['acq_mode']]
-    
-    check_spacing(config_sar['spacing'])
-    
+
     sar_flag = 'sar' in config_proc['mode']
     nrb_flag = 'nrb' in config_proc['mode']
     orb_flag = 'orb' in config_proc['mode']
+    use_custom_tiles = config_proc['custom_tile_grid'] is not None
+    use_custom_dem = config_proc['dem_type'] == 'custom_dem'
+    custom_dem_file = config_proc['custom_dem_file']
+    custom_dem_apply_geoid = config_proc['custom_dem_apply_geoid']
+    custom_dem_geoid_isg = config_proc['custom_dem_geoid_isg']
+    geoid_block_size = config_proc['geoid_block_size']
+    custom_geoid_model_path = None
+    requested_polarizations = config_proc['polarizations']
+    if requested_polarizations is not None:
+        requested_polarizations = list(dict.fromkeys([x.upper() for x in requested_polarizations]))
+        key = '_'.join(sorted(requested_polarizations))
+        allowed = {'HH', 'VV', 'HH_HV', 'VH_VV'}
+        if key not in allowed:
+            raise RuntimeError(
+                "unsupported polarization selection. Allowed combinations are: "
+                "HH, VV, HH+HV, VV+VH"
+            )
+    
+    if use_custom_tiles:
+        log.info("custom_tile_grid is set - skipping MGRS spacing constraints")
+    else:
+        check_spacing(config_sar['spacing'])
+    
+    custom_tiles = None
+    custom_grid_union_extent = None
+    custom_grid_union_geom = None
+    custom_grid_union_geom_wgs84 = None
+    custom_grid_epsg = None
+    if use_custom_tiles:
+        custom_tiles = load_custom_tiles(
+            grid_file=config_proc['custom_tile_grid'],
+            tile_id_field=config_proc['custom_tile_id_field'],
+            aoi_tiles=config_proc['aoi_tiles'],
+            aoi_geometry=config_proc['aoi_geometry']
+        )
+        custom_grid_union_extent = union_extent(custom_tiles)
+        custom_grid_union_geom = union_geometry(custom_tiles)
+        custom_grid_epsg = custom_tiles[0].epsg
+        custom_grid_union_geom_wgs84 = reproject_geometry(
+            geometry=custom_grid_union_geom,
+            src_epsg=custom_grid_epsg,
+            dst_epsg=4326
+        )
+        log.info(
+            f"using custom tile grid with {len(custom_tiles)} tile(s): "
+            f"{config_proc['custom_tile_grid']}"
+        )
+    use_custom_sar_geocode = use_custom_tiles
+    if use_custom_sar_geocode:
+        log.info(f"SAR geocoding will use custom grid CRS EPSG:{custom_grid_epsg} "
+                 "(single CRS, per-scene clipped extent)")
     
     # DEM download authentication
-    username, password = dem.authenticate(dem_type=config_proc['dem_type'],
-                                          username=None, password=None)
+    if use_custom_dem:
+        username = password = None
+        log.info(f"using custom DEM file: {custom_dem_file}")
+        if custom_dem_apply_geoid:
+            custom_geoid_model_path = prepare_custom_geoid_model(
+                geoid_isg=custom_dem_geoid_isg,
+                cache_dir=config_proc['tmp_dir'],
+                work_dir=config_proc['work_dir'],
+                log=log
+            )
+            log.info("custom DEM geoid correction enabled "
+                     f"(orthometric_to_ellipsoidal)")
+        else:
+            custom_geoid_model_path = None
+            log.info("custom DEM geoid correction disabled by configuration")
+    else:
+        username, password = dem.authenticate(dem_type=config_proc['dem_type'],
+                                              username=None, password=None)
     ####################################################################################################################
     # scene selection
     log.info('collecting scenes')
@@ -71,7 +146,7 @@ def main(config_file=None, debug=False, **kwargs):
             scenes = finder(target=config_proc['scene_dir'],
                             matchlist=[r'^S1[ABCD].*(SAFE|zip)$'],
                             regex=True, recursive=True, foldermode=1)
-            archive.insert(scenes)
+            archive_insert_safely(archive=archive, scenes=scenes, log=log)
     elif stac_catalog_set and stac_collections_set:
         archive = search.STACArchive(url=config_proc['stac_catalog'],
                                      collections=config_proc['stac_collections'])
@@ -81,19 +156,39 @@ def main(config_file=None, debug=False, **kwargs):
         raise RuntimeError('could not select a search option. Please check your configuration.')
     
     if config_proc['scene'] is None:
-        attr_search = ['sensor', 'product', 'mindate', 'maxdate',
-                       'aoi_tiles', 'aoi_geometry', 'date_strict']
-        dict_search = {k: config_proc[k] for k in attr_search}
-        dict_search['acquisition_mode'] = config_proc['acq_mode']
-        
         if config_proc['datatake'] is not None:
             frame_number = [int(x, 16) for x in config_proc['datatake']]
         else:
             frame_number = None
-        dict_search['frameNumber'] = frame_number
         
-        selection, aoi_tiles = scene_select(archive=archive,
-                                            **dict_search)
+        if use_custom_tiles:
+            # Use the union extent of custom tiles for scene selection.
+            ext = custom_grid_union_extent
+            select_kwargs = dict(sensor=config_proc['sensor'],
+                                 product=config_proc['product'],
+                                 acquisition_mode=config_proc['acq_mode'],
+                                 mindate=config_proc['mindate'],
+                                 maxdate=config_proc['maxdate'],
+                                 date_strict=config_proc['date_strict'])
+            if frame_number is not None:
+                select_kwargs['frameNumber'] = frame_number
+            with bbox(coordinates=ext, crs=custom_tiles[0].epsg) as search_box:
+                select_kwargs['vectorobject'] = search_box
+                try:
+                    selection = archive.select(**select_kwargs)
+                except TypeError:
+                    # Some archive implementations may not support frameNumber.
+                    select_kwargs.pop('frameNumber', None)
+                    selection = archive.select(**select_kwargs)
+            aoi_tiles = [x.mgrs for x in custom_tiles]
+        else:
+            attr_search = ['sensor', 'product', 'mindate', 'maxdate',
+                           'aoi_tiles', 'aoi_geometry', 'date_strict']
+            dict_search = {k: config_proc[k] for k in attr_search}
+            dict_search['acquisition_mode'] = config_proc['acq_mode']
+            dict_search['frameNumber'] = frame_number
+            selection, aoi_tiles = scene_select(archive=archive,
+                                                **dict_search)
         
         if len(selection) == 0:
             log.error('could not find any scenes')
@@ -102,10 +197,27 @@ def main(config_file=None, debug=False, **kwargs):
         
         log.info(f'found {len(selection)} scene(s)')
         scenes = identify_many(selection, sortkey='start')
+        if requested_polarizations is not None:
+            before = len(scenes)
+            req = set(requested_polarizations)
+            scenes = [x for x in scenes if req.issubset(set(x.polarizations))]
+            removed = before - len(scenes)
+            if removed > 0:
+                log.info(f"filtered out {removed} scene(s) not matching "
+                         f"requested polarizations: {requested_polarizations}")
+            if len(scenes) == 0:
+                log.error(f"no scenes left after polarization filtering: {requested_polarizations}")
+                archive.close()
+                return
     else:
         if config_proc['mode'] != ['sar']:
             raise RuntimeError("if argument 'scene' is set, the processing mode must be 'sar'")
         scenes = [identify(config_proc['scene'])]
+        if requested_polarizations is not None:
+            req = set(requested_polarizations)
+            if not req.issubset(set(scenes[0].polarizations)):
+                raise RuntimeError(f"scene does not contain requested polarizations: "
+                                   f"{requested_polarizations}")
         config_proc['acq_mode'] = scenes[0].acquisition_mode
         config_proc['product'] = scenes[0].product
         aoi_tiles = []
@@ -195,22 +307,46 @@ def main(config_file=None, debug=False, **kwargs):
                 tmp_dir_scene = os.path.join(config_proc['tmp_dir'], scene_base)
                 
                 log.info(f'processing scene {i + 1}/{len(scenes)}: {scene.scene}')
-                if os.path.isdir(out_dir_scene) and not update:
-                    log.info('Already processed - Skip!')
-                    continue
-                else:
-                    os.makedirs(out_dir_scene, exist_ok=True)
-                    os.makedirs(tmp_dir_scene, exist_ok=True)
+                if not update:
+                    expected_epsgs = expected_sar_epsgs(
+                        scene=scene,
+                        use_custom_sar_geocode=use_custom_sar_geocode,
+                        custom_grid_epsg=custom_grid_epsg,
+                        log=log
+                    )
+                    if sar_outputs_complete(
+                            processor=processor,
+                            scene_path=scene.scene,
+                            sar_dir=config_proc['sar_dir'],
+                            epsgs=expected_epsgs,
+                            log=log):
+                        log.info('SAR outputs already complete - Skip!')
+                        continue
+                    if os.path.isdir(out_dir_scene):
+                        log.info('scene output folder exists but SAR outputs are incomplete - continue processing')
+                os.makedirs(out_dir_scene, exist_ok=True)
+                os.makedirs(tmp_dir_scene, exist_ok=True)
                 ########################################################################################################
                 # Preparation of DEM for SAR processing
-                dem_prepare_mode = config_sar['dem_prepare_mode']
-                if dem_prepare_mode is not None:
-                    fname_dem = dem.prepare(scene=scene, dem_type=config_proc['dem_type'],
-                                            dir_out=tmp_dir_scene, username=username,
-                                            password=password, mode=dem_prepare_mode,
-                                            tr=(config_sar['spacing'], config_sar['spacing']))
+                if use_custom_dem:
+                    fname_dem = prepare_custom_dem(
+                        custom_dem_file=custom_dem_file,
+                        scene=scene,
+                        tmp_dir_scene=tmp_dir_scene,
+                        spacing=config_sar['spacing'],
+                        geoid_model_path=custom_geoid_model_path,
+                        geoid_block_size=geoid_block_size,
+                        log=log
+                    )
                 else:
-                    fname_dem = None
+                    dem_prepare_mode = config_sar['dem_prepare_mode']
+                    if dem_prepare_mode is not None:
+                        fname_dem = dem.prepare(scene=scene, dem_type=config_proc['dem_type'],
+                                                dir_out=tmp_dir_scene, username=username,
+                                                password=password, mode=dem_prepare_mode,
+                                                tr=(config_sar['spacing'], config_sar['spacing']))
+                    else:
+                        fname_dem = None
                 ########################################################################################################
                 # determination of look factors
                 if scene.product == 'SLC':
@@ -229,14 +365,35 @@ def main(config_file=None, debug=False, **kwargs):
                 start_time = time.time()
                 try:
                     log.info('starting SAR processing')
+                    geocode_target_extent = None
+                    if use_custom_sar_geocode:
+                        # `cesard.snap.geo` checks scene overlap via
+                        # pyroSAR `sub_parametrize`, which expects geometry in
+                        # geographic coordinates for this step.
+                        geocode_target_extent = scene_extent_in_grid(
+                            scene=scene,
+                            grid_epsg=4326,
+                            clip_geometry=custom_grid_union_geom_wgs84
+                        )
+                        if geocode_target_extent is None:
+                            log.info("scene does not overlap custom grid extent in target CRS - skip")
+                            continue
                     proc_args = {'scene': scene.scene,
                                  'outdir': config_proc['sar_dir'],
                                  'measurement': measurement,
+                                 'polarizations': requested_polarizations,
                                  'tmpdir': config_proc['tmp_dir'],
                                  'dem': fname_dem,
                                  'neighbors': neighbors[h][i],
                                  'export_extra': export_extra,
                                  'rlks': rlks, 'azlks': azlks}
+                    if use_custom_sar_geocode:
+                        proc_args.update({
+                            'geocode_target_epsg': custom_grid_epsg,
+                            'geocode_target_extent': geocode_target_extent,
+                            'geocode_align_x': custom_grid_union_extent['xmin'],
+                            'geocode_align_y': custom_grid_union_extent['ymax']
+                        })
                     proc_args.update(config_sar)
                     sig = inspect.signature(processor.process)
                     accepted_params = set(sig.parameters.keys())
@@ -270,32 +427,50 @@ def main(config_file=None, debug=False, **kwargs):
         
         for s, scenes in enumerate(scenes_grouped):
             log.info(f'ARD processing of group {s + 1}/{len(scenes_grouped)}')
-            log.info('preparing WBM tiles')
+            group_start = time.time()
+            products_done = 0
+            products_skipped = 0
             vec = [x.geometry() for x in scenes]
-            extent = get_max_ext(geometries=vec)
-            with bbox(coordinates=extent, crs=4326) as box:
-                dem.retile(vector=box, threads=gdal_prms['threads'],
-                           dem_dir=None, wbm_dir=config_proc['wbm_dir'],
-                           dem_type=config_proc['dem_type'],
-                           tilenames=aoi_tiles, username=username, password=password,
-                           dem_strict=True)
-            # get the geometries of all tiles that overlap with the current scene group
-            tiles = tile_ex.tile_from_aoi(vector=vec,
-                                          return_geometries=True,
-                                          tilenames=aoi_tiles)
+            if use_custom_tiles:
+                tiles = filter_tiles_by_scenes(tiles=custom_tiles, scenes=scenes)
+            else:
+                if not use_custom_dem:
+                    log.info('preparing WBM tiles')
+                    extent = get_max_ext(geometries=vec)
+                    with bbox(coordinates=extent, crs=4326) as box:
+                        dem.retile(vector=box, threads=gdal_prms['threads'],
+                                   dem_dir=None, wbm_dir=config_proc['wbm_dir'],
+                                   dem_type=config_proc['dem_type'],
+                                   tilenames=aoi_tiles, username=username, password=password,
+                                   dem_strict=True)
+                # get the geometries of all tiles that overlap with the current scene group
+                tiles = tile_ex.tile_from_aoi(vector=vec,
+                                              return_geometries=True,
+                                              tilenames=aoi_tiles)
             del vec
             t_total = len(tiles)
+            if t_total == 0:
+                log.info('no target tiles overlap this scene group - skip')
+                continue
             for t, tile in enumerate(tiles):
                 # select all scenes from the group whose footprint overlaps with the current tile
-                scenes_sub = [x for x in scenes if intersect(tile, x.geometry())]
+                if use_custom_tiles:
+                    scenes_sub = [x for x in scenes
+                                  if scene_intersects_tile(scene=x, tile=tile)]
+                else:
+                    scenes_sub = [x for x in scenes if intersect(tile, x.geometry())]
                 scenes_sub_fnames = [x.scene for x in scenes_sub]
-                fname_wbm = os.path.join(config_proc['wbm_dir'],
-                                         config_proc['dem_type'],
-                                         '{}_WBM.tif'.format(tile.mgrs))
-                if not os.path.isfile(fname_wbm):
+                if use_custom_tiles or use_custom_dem:
                     fname_wbm = None
+                else:
+                    fname_wbm = os.path.join(config_proc['wbm_dir'],
+                                             config_proc['dem_type'],
+                                             '{}_WBM.tif'.format(tile.mgrs))
+                    if not os.path.isfile(fname_wbm):
+                        fname_wbm = None
                 add_dem = True  # add the DEM as output layer?
-                dem_type = config_proc['dem_type'] if add_dem else None
+                dem_type = config_proc['dem_type'] if add_dem and not use_custom_dem else None
+                dem_file = custom_dem_file if add_dem and use_custom_dem else None
                 extent = tile.extent
                 epsg = tile.getProjection('epsg')
                 log.info(f'creating product {t + 1}/{t_total}')
@@ -304,9 +479,11 @@ def main(config_file=None, debug=False, **kwargs):
                 prod_meta = ard.product_info(
                     product_type=product_type, src_ids=scenes_sub,
                     tile_id=tile.mgrs, extent=extent, epsg=epsg,
-                    dir_ard=config_proc['ard_dir'], update=update
+                    dir_ard=config_proc['ard_dir'], update=update,
+                    polarizations=requested_polarizations
                 )
                 if prod_meta is None:
+                    products_skipped += 1
                     continue
                 log.info(f"product name: {prod_meta['dir_ard_product']}")
                 
@@ -323,6 +500,7 @@ def main(config_file=None, debug=False, **kwargs):
                             src_ids=src_ids, sar_assets=sar_assets,
                             tile=tile.mgrs, extent=extent, epsg=epsg,
                             wbm=fname_wbm, dem_type=dem_type,
+                            custom_dem_file=dem_file,
                             compress='LERC_ZSTD',
                             multithread=gdal_prms['multithread'],
                             annotation=annotation
@@ -332,10 +510,15 @@ def main(config_file=None, debug=False, **kwargs):
                             src_ids=src_ids, assets=ard_assets,
                             compression='LERC_ZSTD'
                         )
+                        products_done += 1
                     else:
                         shutil.rmtree(prod_meta['dir_ard_product'])
+                        products_skipped += 1
                 except Exception as e:
                     log.error(msg=e)
                     raise
             del tiles
+            dt = round(time.time() - group_start, 2)
+            log.info(f'ARD processing of group {s + 1}/{len(scenes_grouped)} completed '
+                     f'in {dt} seconds (products created: {products_done}, skipped: {products_skipped})')
         gdal.SetConfigOption('GDAL_NUM_THREADS', gdal_prms['threads_before'])
