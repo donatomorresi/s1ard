@@ -1,6 +1,8 @@
 import os
 import re
 import copy
+import warnings
+import urllib.parse
 import importlib.resources
 from datetime import datetime, timedelta
 import configparser
@@ -51,7 +53,7 @@ def _get_config_processing(parser, **kwargs):
     except KeyError:
         msg = "Section 'PROCESSING' does not exist in the config file"
         raise KeyError(msg)
-    
+
     # override config file parameters with additional keyword arguments
     for k, v in kwargs.items():
         if k in allowed_keys:
@@ -68,11 +70,18 @@ def _get_config_processing(parser, **kwargs):
         'tmp_dir': 'TMP',
         'ard_dir': 'ARD',
         'wbm_dir': 'WBM',
+        'custom_tile_grid': 'None',
+        'custom_tile_id_field': 'tile_id',
+        'custom_dem_file': 'None',
+        'custom_dem_apply_geoid': 'True',
+        'custom_dem_geoid_isg': 'None',
+        'geoid_block_size': '1024',
         'gdal_threads': '4',
         'dem_type': 'Copernicus 30m Global DEM',
         'date_strict': 'True',
         'datatake': 'None',
         'measurement': 'gamma',
+        'polarizations': 'None',
         'annotation': 'dm,ei,id,lc,li,np,ratio',
         'logfile': 'None',
         'parquet': 'None',
@@ -84,10 +93,12 @@ def _get_config_processing(parser, **kwargs):
         'acq_mode': ['IW', 'EW', 'SM'],
         'annotation': ['dm', 'ei', 'em', 'id', 'lc',
                        'ld', 'li', 'np', 'ratio', 'wm'],
+        'polarizations': ['HH', 'HV', 'VV', 'VH'],
         'dem_type': ['Copernicus 10m EEA DEM',
                      'Copernicus 30m Global DEM',
                      'Copernicus 30m Global DEM II',
-                     'GETASSE30'],
+                     'GETASSE30',
+                     'custom_dem'],
         'measurement': ['gamma', 'sigma'],
         'mode': ['sar', 'nrb', 'orb'],
         'product': ['GRD', 'SLC'],
@@ -96,6 +107,9 @@ def _get_config_processing(parser, **kwargs):
     for k, v in processing_defaults.items():
         if k not in proc_sec.keys():
             proc_sec[k] = v
+    custom_grid_raw = proc_sec.get('custom_tile_grid', fallback='None')
+    custom_grid_set = custom_grid_raw not in ['', 'None']
+    use_custom_dem_mode = proc_sec.get('dem_type', processing_defaults['dem_type']) == 'custom_dem'
     
     # check completeness of configuration parameters
     missing = []
@@ -112,10 +126,18 @@ def _get_config_processing(parser, **kwargs):
         # check if key is allowed and convert 'None|none|' strings to None
         v = keyval_check(key=k, val=v, allowed_keys=allowed_keys)
         
-        if k in ['annotation', 'aoi_tiles', 'data_take', 'mode', 'stac_collections']:
+        if k in ['annotation', 'aoi_tiles', 'data_take', 'mode', 'stac_collections', 'polarizations']:
             v = proc_sec.get_list(k)
-        
-        validate_value(k, v)
+            if k == 'polarizations' and v is not None:
+                v = [x.upper() for x in v]
+        try:
+            validate_value(k, v)
+        except Exception:
+            allow_custom_tile_ids = k == 'aoi_tiles' and custom_grid_set
+            if k not in ['custom_dem_file', 'custom_dem_apply_geoid', 'custom_tile_grid',
+                         'custom_tile_id_field', 'custom_dem_geoid_isg',
+                         'geoid_block_size'] and not allow_custom_tile_ids:
+                raise
         
         if k == 'mindate' and v is not None:
             v = proc_sec.get_datetime(k)
@@ -133,23 +155,58 @@ def _get_config_processing(parser, **kwargs):
                 assert v is not None and os.path.isdir(v), msg
             else:
                 v = os.path.join(proc_sec['work_dir'], v)
-        if k.endswith('_file') and not k.startswith('db'):
+        if k.endswith('_file') and not k.startswith('db') and v is not None:
             msg = f"Parameter '{k}': file {v} could not be found"
             if os.path.isabs(v):
-                assert os.path.isfile(v), msg
+                if k != 'custom_dem_file' or use_custom_dem_mode:
+                    assert os.path.isfile(v), msg
             else:
                 v = os.path.join(proc_sec['work_dir'], v)
-                assert os.path.isfile(v), msg
+                if k != 'custom_dem_file' or use_custom_dem_mode:
+                    assert os.path.isfile(v), msg
+        if k in ['aoi_geometry', 'custom_tile_grid'] and v is not None:
+            msg = f"Parameter '{k}': file {v} could not be found"
+            if not os.path.isabs(v):
+                v = os.path.join(proc_sec['work_dir'], v)
+            assert os.path.isfile(v), msg
+        if k == 'custom_dem_geoid_isg' and v is not None and use_custom_dem_mode:
+            is_url = re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', v) is not None
+            if is_url:
+                parsed = urllib.parse.urlparse(v)
+                path_part = parsed.path or ''
+                if not path_part.lower().endswith('.isg'):
+                    warnings.warn(
+                        "Parameter 'custom_dem_geoid_isg' does not end with '.isg'. "
+                        "This setting is expected to point to an ISG file.",
+                        UserWarning
+                    )
+            else:
+                msg = f"Parameter '{k}': file {v} could not be found"
+                if os.path.isabs(v):
+                    assert os.path.isfile(v), msg
+                else:
+                    v = os.path.join(proc_sec['work_dir'], v)
+                    assert os.path.isfile(v), msg
+                if not v.lower().endswith('.isg'):
+                    warnings.warn(
+                        "Parameter 'custom_dem_geoid_isg' does not end with '.isg'. "
+                        "This setting is expected to point to an ISG file.",
+                        UserWarning
+                    )
         if k in ['db_file', 'logfile'] and v is not None:
             if not os.path.isabs(v):
                 v = os.path.join(proc_sec['work_dir'], v)
-        if k in ['gdal_threads', 'spacing_iw', 'spacing_sm', 'spacing_ew']:
+        if k in ['gdal_threads', 'spacing_iw', 'spacing_sm', 'spacing_ew', 'geoid_block_size']:
             v = int(v)
-        if k in ['date_strict']:
+        if k in ['date_strict', 'custom_dem_apply_geoid']:
             v = proc_sec.getboolean(k)
         
-        validate_options(k, v, options=processing_options)
+        if k in processing_options and v is not None:
+            validate_options(k, v, options=processing_options)
         out[k] = v
+
+    if out['geoid_block_size'] < 128:
+        raise RuntimeError("Parameter 'geoid_block_size' must be >= 128")
     
     # check that a valid scene search option is set
     db_file_set = out['db_file'] is not None
@@ -166,6 +223,22 @@ def _get_config_processing(parser, **kwargs):
     
     if stac_catalog_set and not stac_collections_set:
         raise RuntimeError("'stac_collections' must be defined if data is to be searched in a STAC.")
+
+    # Custom DEM mode is controlled via dem_type=custom_dem.
+    custom_dem_geoid_keys = ['custom_dem_geoid_isg']
+    if out['dem_type'] == 'custom_dem':
+        if out.get('custom_dem_file') is None:
+            raise RuntimeError(
+                "dem_type='custom_dem' requires 'custom_dem_file' to be set"
+            )
+        if out.get('custom_dem_apply_geoid', True):
+            missing = [k for k in custom_dem_geoid_keys if out.get(k) is None]
+            if len(missing) > 0:
+                missing_str = ', '.join(missing)
+                raise RuntimeError(
+                    "custom_dem_apply_geoid=True requires the following parameters to be set: "
+                    f"{missing_str}"
+                )
     
     return out
 
@@ -267,9 +340,14 @@ def get_keys(section: str) -> list[str]:
     if section == 'processing':
         return ['acq_mode', 'annotation', 'aoi_geometry', 'aoi_tiles',
                 'ard_dir', 'datatake', 'date_strict', 'db_file', 'dem_type',
+                'custom_dem_file', 'custom_dem_apply_geoid',
+                'custom_dem_geoid_isg',
+                'geoid_block_size',
+                'custom_tile_grid', 'custom_tile_id_field',
                 'gdal_threads', 'logfile', 'maxdate',
-                'measurement', 'mindate', 'mode', 'parquet', 'processor',
-                'product', 'sar_dir', 'scene', 'scene_dir', 'sensor',
+                'measurement', 'mindate', 'mode', 'parquet', 'polarizations', 'processor',
+                'product', 'sar_dir',
+                'scene', 'scene_dir', 'sensor',
                 'spacing_ew', 'spacing_iw', 'spacing_sm',
                 'stac_catalog', 'stac_collections', 'tmp_dir', 'wbm_dir', 'work_dir']
     elif section == 'metadata':
@@ -317,8 +395,7 @@ def init(
 
     """
     if source is None:
-        with importlib.resources.path(package='s1ard.resources',
-                                      resource='config.ini') as path:
+        with importlib.resources.path('s1ard.resources', 'config.ini') as path:
             source = str(path)
     config = get_config(config_file=source, **kwargs)
     write(config=config, target=target, overwrite=overwrite)
@@ -346,8 +423,7 @@ def read_config_file(config_file: str | None = None) -> configparser.ConfigParse
         if not os.path.isfile(config_file):
             raise FileNotFoundError(f"Config file {config_file} does not exist.")
     else:
-        with importlib.resources.path(package='s1ard.resources',
-                                      resource='config.ini') as path:
+        with importlib.resources.path('s1ard.resources', 'config.ini') as path:
             config_file = str(path)
     
     parser.read(config_file)
@@ -433,7 +509,8 @@ def write(config, target, overwrite=False, **kwargs):
             config[processor_name][k] = v
         else:
             raise KeyError("Parameter '{}' is not supported".format(k))
-    keys_path_relative = ['sar_dir', 'tmp_dir', 'ard_dir', 'wbm_dir', 'db_file']
+    keys_path_relative = ['sar_dir', 'tmp_dir', 'ard_dir', 'wbm_dir',
+                          'db_file', 'custom_dem_file', 'custom_tile_grid']
     work_dir = config['processing']['work_dir']
     for k in keys_path_relative:
         v = config['processing'][k]
