@@ -112,8 +112,8 @@ def get_config_keys():
     List[str]
     """
     return ['allow_res_osv', 'clean_edges', 'clean_edges_pixels', 'cleanup',
-            'reset_locks_on_start',
-            'dem_resampling_method', 'gpt_args', 'img_resampling_method']
+            'dem_resampling_method', 'gpt_args', 'img_resampling_method',
+            'reset_locks_on_start']
 
 
 def get_config_section(parser, **kwargs):
