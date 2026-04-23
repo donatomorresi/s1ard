@@ -36,19 +36,31 @@ class SnapProcessor(Processor):
     
     @staticmethod
     def process(scene: str, outdir: str, tmpdir: str, dem: str, measurement: str,
+                polarizations: list[str] | None,
                 spacing: int | float, dem_resampling_method: str,
                 img_resampling_method: str, rlks: int | None, azlks: int | None,
                 export_extra: list[str] | None, allow_res_osv: bool, clean_edges: bool,
                 clean_edges_pixels: int, neighbors: list[str] | None,
-                gpt_args: list[str] | None, cleanup: bool) -> None:
+                gpt_args: list[str] | None, cleanup: bool,
+                reset_locks_on_start: bool = False,
+                geocode_target_epsg: int | None = None,
+                geocode_target_extent: dict[str, float] | None = None,
+                geocode_align_x: float | None = None,
+                geocode_align_y: float | None = None) -> None:
         return snap.process(scene=scene, outdir=outdir, tmpdir=tmpdir, dem=dem,
-                            measurement=measurement, spacing=spacing,
+                            measurement=measurement, polarizations=polarizations,
+                            spacing=spacing,
                             dem_resampling_method=dem_resampling_method,
                             img_resampling_method=img_resampling_method,
                             rlks=rlks, azlks=azlks, export_extra=export_extra,
                             allow_res_osv=allow_res_osv, clean_edges=clean_edges,
                             clean_edges_pixels=clean_edges_pixels,
-                            neighbors=neighbors, gpt_args=gpt_args, cleanup=cleanup)
+                            neighbors=neighbors, gpt_args=gpt_args, cleanup=cleanup,
+                            reset_locks_on_start=reset_locks_on_start,
+                            geocode_target_epsg=geocode_target_epsg,
+                            geocode_target_extent=geocode_target_extent,
+                            geocode_align_x=geocode_align_x,
+                            geocode_align_y=geocode_align_y)
     
     @staticmethod
     def translate_annotation(annotation: list[str], measurement: str) -> list[str]:

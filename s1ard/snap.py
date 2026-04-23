@@ -1,5 +1,6 @@
 import os
 import re
+import glob
 import shutil
 from math import ceil
 import copy
@@ -29,6 +30,43 @@ import logging
 log = logging.getLogger('s1ard')
 
 
+def _remove_lock_artifacts_for_target(target):
+    """
+    Remove lock sidecar files for a target path.
+    """
+    target = os.path.abspath(os.path.expanduser(target))
+    removed = 0
+    candidates = [target + '.lock']
+    candidates.extend(glob.glob(target + '.used_*'))
+    for item in candidates:
+        try:
+            if os.path.isfile(item):
+                os.remove(item)
+                removed += 1
+        except FileNotFoundError:
+            continue
+    return removed
+
+
+def _remove_lock_artifacts_by_prefix(folder, prefix):
+    """
+    Remove lock sidecars in a folder for all files starting with a prefix.
+    """
+    if not os.path.isdir(folder):
+        return 0
+    removed = 0
+    patterns = [prefix + '*.lock', prefix + '*.used_*']
+    for pattern in patterns:
+        for item in glob.glob(os.path.join(folder, pattern)):
+            try:
+                if os.path.isfile(item):
+                    os.remove(item)
+                    removed += 1
+            except FileNotFoundError:
+                continue
+    return removed
+
+
 # main interface
 
 def config_to_string(config):
@@ -55,7 +93,8 @@ def config_to_string(config):
         if v is None:
             out[k] = 'None'
         elif k in ['allow_res_osv', 'clean_edges',
-                   'clean_edges_pixels', 'cleanup']:
+                   'clean_edges_pixels', 'cleanup',
+                   'reset_locks_on_start']:
             out[k] = str(v)
         elif k == 'gpt_args' and isinstance(v, list):
             out[k] = ' '.join(v)
@@ -73,6 +112,7 @@ def get_config_keys():
     List[str]
     """
     return ['allow_res_osv', 'clean_edges', 'clean_edges_pixels', 'cleanup',
+            'reset_locks_on_start',
             'dem_resampling_method', 'gpt_args', 'img_resampling_method']
 
 
@@ -97,6 +137,7 @@ def get_config_section(parser, **kwargs):
         'clean_edges_pixels': '4',
         'dem_resampling_method': 'BILINEAR_INTERPOLATION',
         'gpt_args': 'None',
+        'reset_locks_on_start': 'False',
         'img_resampling_method': 'BILINEAR_INTERPOLATION',
     }
     if 'SNAP' in parser.sections():
@@ -120,7 +161,7 @@ def get_config_section(parser, **kwargs):
                 v = v.split(' ')
         if k == 'clean_edges_pixels':
             v = section.getint(k)
-        if k in ['allow_res_osv', 'clean_edges', 'cleanup']:
+        if k in ['allow_res_osv', 'clean_edges', 'cleanup', 'reset_locks_on_start']:
             v = section.getboolean(k)
         out[k] = v
     out['dem_prepare_mode'] = 'single-4326'
@@ -152,11 +193,15 @@ def get_metadata(scene, outdir):
 
 
 def process(scene, outdir, measurement, spacing, dem,
+            polarizations=None,
             dem_resampling_method='BILINEAR_INTERPOLATION',
             img_resampling_method='BILINEAR_INTERPOLATION',
             rlks=None, azlks=None, tmpdir=None, export_extra=None,
             allow_res_osv=True, clean_edges=True, clean_edges_pixels=4,
-            neighbors=None, gpt_args=None, cleanup=True):
+            neighbors=None, gpt_args=None, cleanup=True,
+            reset_locks_on_start=False,
+            geocode_target_epsg=None, geocode_target_extent=None,
+            geocode_align_x=None, geocode_align_y=None):
     """
     Main function for SAR processing with SNAP.
 
@@ -171,6 +216,9 @@ def process(scene, outdir, measurement, spacing, dem,
 
         - gamma: RTC gamma nought (:math:`\\gamma^0_T`)
         - sigma: RTC sigma nought (:math:`\\sigma^0_T`)
+    polarizations: list[str] or None
+        Optional polarization subset to process, e.g. ['VV', 'VH'].
+        If None, all polarizations available in the scene are used.
     spacing: int or float
         The output pixel spacing in meters.
     dem: str
@@ -218,6 +266,24 @@ def process(scene, outdir, measurement, spacing, dem,
         - e.g. ``['-x', '-c', '2048M']`` for increased tile cache size and intermediate clearing
     cleanup: bool
         Delete intermediate files after successful process termination?
+    reset_locks_on_start: bool
+        Remove stale lock sidecar files (`.lock`, `.used_*`) at processing start.
+        This is useful for recovering from interrupted runs on the same scene.
+        Keep disabled when concurrent jobs may touch the same targets.
+    geocode_target_epsg: int or None
+        Optional target EPSG for geocoding. If set together with
+        `geocode_target_extent`, geocoding is performed once in this CRS
+        instead of splitting by UTM zones.
+    geocode_target_extent: dict[str, float] or None
+        Optional geocoding subset extent with keys xmin, ymin, xmax and ymax.
+        This extent is used for scene overlap checks and subsetting prior to
+        geocoding.
+    geocode_align_x: float or None
+        Optional x-origin for geocoding grid alignment. If None, defaults to
+        `geocode_target_extent['xmin']`.
+    geocode_align_y: float or None
+        Optional y-origin for geocoding grid alignment. If None, defaults to
+        `geocode_target_extent['ymax']`.
 
     Returns
     -------
@@ -252,6 +318,22 @@ def process(scene, outdir, measurement, spacing, dem,
     
     out_base = os.path.join(outdir_scene, basename)
     tmp_base = os.path.join(tmpdir_scene, basename)
+
+    if reset_locks_on_start:
+        removed = 0
+        # main scene temp products
+        for target in [tmp_base + '_pre.dim',
+                       tmp_base + '_buf.dim',
+                       tmp_base + '_mli.dim',
+                       tmp_base + '_rtc.dim',
+                       tmp_base + '_gsr.dim',
+                       tmp_base + '_sgr.dim']:
+            removed += _remove_lock_artifacts_for_target(target=target)
+        # geocoded outputs in SAR directory (all EPSGs for this scene)
+        removed += _remove_lock_artifacts_by_prefix(folder=outdir_scene,
+                                                    prefix=basename + '_geo_')
+        if removed > 0:
+            log.warning(f'reset stale lock artifacts at startup for scene {basename}: {removed} file(s) removed')
     
     id = identify(scene)
     workflows = []
@@ -271,7 +353,8 @@ def process(scene, outdir, measurement, spacing, dem,
             pre(src=scene, dst=out_pre, workflow=out_pre_wf,
                 allow_res_osv=allow_res_osv, output_noise=output_noise,
                 output_beta0=apply_rtc, gpt_args=gpt_args,
-                add_slice_num=apply_grd_buffering)
+                add_slice_num=apply_grd_buffering,
+                polarizations=polarizations)
         else:
             log.info('main scene has already been preprocessed')
     ############################################################################
@@ -286,12 +369,17 @@ def process(scene, outdir, measurement, spacing, dem,
             tmp_base_nb = os.path.join(tmpdir_nb, basename_nb)
             out_pre_nb = tmp_base_nb + '_pre.dim'
             out_pre_nb_wf = out_pre_nb.replace('.dim', '.xml')
+            if reset_locks_on_start:
+                removed = _remove_lock_artifacts_for_target(target=out_pre_nb)
+                if removed > 0:
+                    log.warning(f'reset stale lock artifacts for neighbor scene {basename_nb}: {removed} file(s) removed')
             with Lock(out_pre_nb):
                 if not os.path.isfile(out_pre_nb):
                     log.info(f'preprocessing GRD neighbor: {item}')
                     pre(src=item, dst=out_pre_nb, workflow=out_pre_nb_wf,
                         allow_res_osv=allow_res_osv, output_noise=output_noise,
-                        output_beta0=apply_rtc, gpt_args=gpt_args)
+                        output_beta0=apply_rtc, gpt_args=gpt_args,
+                        polarizations=polarizations)
                 else:
                     log.info(f'GRD neighbor has already been preprocessed: {item}')
             out_pre_neighbors.append(out_pre_nb)
@@ -346,11 +434,13 @@ def process(scene, outdir, measurement, spacing, dem,
             with Lock(out_rtc):
                 if not os.path.isfile(out_rtc):
                     log.info('radiometric terrain correction')
-                    rtc(src=out_mli, dst=out_rtc, workflow=out_rtc_wf, dem=dem,
-                        dem_resampling_method=dem_resampling_method,
-                        sigma0=output_sigma0_rtc,
-                        scattering_area='scatteringArea' in export_extra,
-                        gpt_args=gpt_args)
+                    rtc_kwargs = dict(src=out_mli, dst=out_rtc,
+                                      workflow=out_rtc_wf, dem=dem,
+                                      dem_resampling_method=dem_resampling_method,
+                                      sigma0=output_sigma0_rtc,
+                                      scattering_area='scatteringArea' in export_extra,
+                                      gpt_args=gpt_args)
+                    rtc(**rtc_kwargs)
         ########################################################################
         # gamma-sigma ratio computation
         out_gsr = None
@@ -393,7 +483,10 @@ def process(scene, outdir, measurement, spacing, dem,
                 if not os.path.isfile(out_geo):
                     log.info(f'geocoding to EPSG:{epsg}')
                     scene1 = identify(out_mli)
-                    pols = scene1.polarizations
+                    if polarizations is None:
+                        pols = scene1.polarizations
+                    else:
+                        pols = [x.upper() for x in polarizations]
                     bands0 = ['NESZ_{}'.format(pol) for pol in pols]
                     if measurement == 'gamma':
                         bands1 = ['Gamma0_{}'.format(pol) for pol in pols]
@@ -433,14 +526,23 @@ def process(scene, outdir, measurement, spacing, dem,
             if wf != wf_dst and not os.path.isfile(wf_dst):
                 shutil.copyfile(src=wf, dst=wf_dst)
     
-    log.info('determining UTM zone overlaps')
-    aois = aoi_from_scene(scene=id, multi=utm_multi)
-    for aoi in aois:
-        ext = aoi['extent']
-        epsg = aoi['epsg']
-        align_x = aoi['extent_utm']['xmin']
-        align_y = aoi['extent_utm']['ymax']
+    if geocode_target_epsg is not None:
+        if geocode_target_extent is None:
+            raise RuntimeError("geocode_target_extent must be set when geocode_target_epsg is used")
+        ext = geocode_target_extent
+        epsg = geocode_target_epsg
+        align_x = geocode_align_x if geocode_align_x is not None else ext['xmin']
+        align_y = geocode_align_y if geocode_align_y is not None else ext['ymax']
         run()
+    else:
+        log.info('determining UTM zone overlaps')
+        aois = aoi_from_scene(scene=id, multi=utm_multi)
+        for aoi in aois:
+            ext = aoi['extent']
+            epsg = aoi['epsg']
+            align_x = aoi['extent_utm']['xmin']
+            align_y = aoi['extent_utm']['ymax']
+            run()
     ############################################################################
     # delete intermediate files
     if cleanup:
@@ -453,12 +555,20 @@ def process(scene, outdir, measurement, spacing, dem,
                            foldermode=1, recursive=False)
             for item in items:
                 if not re.search(r'_pre\.', item):
-                    if os.path.isfile(item):
-                        os.remove(item)
-                    else:
-                        shutil.rmtree(item)
+                    try:
+                        if os.path.isfile(item):
+                            os.remove(item)
+                        elif os.path.isdir(item):
+                            shutil.rmtree(item)
+                    except FileNotFoundError:
+                        # Item may be removed concurrently by overlapping jobs.
+                        continue
         else:
-            shutil.rmtree(tmpdir_scene)
+            try:
+                shutil.rmtree(tmpdir_scene)
+            except FileNotFoundError:
+                # Temporary scene directory may already be gone.
+                pass
 
 
 def translate_annotation(annotation, measurement):
@@ -843,10 +953,11 @@ def nrt_slice_num(dim):
 
 def pre(src, dst, workflow, allow_res_osv=True, osv_continue_on_fail=False,
         output_noise=True, output_beta0=True, output_sigma0=True,
-        output_gamma0=False, add_slice_num=True, gpt_args=None):
+        output_gamma0=False, add_slice_num=True, gpt_args=None,
+        polarizations=None):
     """
     General SAR preprocessing. The following operators are used (optional steps in brackets):
-    Apply-Orbit-File(->Remove-GRD-Border-Noise)->Calibration->ThermalNoiseRemoval(->TOPSAR-Deburst)
+    Apply-Orbit-File->ThermalNoiseRemoval(->Remove-GRD-Border-Noise)->Calibration(->TOPSAR-Deburst)
 
     Parameters
     ----------
@@ -876,6 +987,9 @@ def pre(src, dst, workflow, allow_res_osv=True, osv_continue_on_fail=False,
         a list of additional arguments to be passed to the gpt call
         
         - e.g. ``['-x', '-c', '2048M']`` for increased tile cache size and intermediate clearing
+    polarizations: list[str] or None
+        Optional polarization subset to process, e.g. ['VV', 'VH'].
+        If None, all polarizations available in the scene are used.
     
     Returns
     -------
@@ -886,7 +1000,15 @@ def pre(src, dst, workflow, allow_res_osv=True, osv_continue_on_fail=False,
     """
     scene = identify(src)
     if not os.path.isfile(workflow):
-        polarizations = scene.polarizations
+        if polarizations is None:
+            polarizations = scene.polarizations
+        else:
+            polarizations = [x.upper() for x in polarizations]
+            scene_pols = set(scene.polarizations)
+            req_pols = set(polarizations)
+            if not req_pols.issubset(scene_pols):
+                missing = sorted(req_pols - scene_pols)
+                raise RuntimeError(f"scene does not contain requested polarizations {missing}: {scene.scene}")
         wf = parse_recipe('blank')
         ############################################
         read = parse_node('Read')
@@ -899,7 +1021,13 @@ def pre(src, dst, workflow, allow_res_osv=True, osv_continue_on_fail=False,
         wf.insert_node(orb, before=read.id)
         last = orb
         ############################################
-        if re.search('S1[A-Z]', scene.sensor) and scene.product == 'GRD':
+        tnr = parse_node('ThermalNoiseRemoval')
+        wf.insert_node(tnr, before=last.id)
+        tnr.parameters['outputNoise'] = output_noise
+        last = tnr
+        ############################################
+        if (re.search('S1[A-Z]', scene.sensor)
+                and scene.product == 'GRD'):
             bn = parse_node('Remove-GRD-Border-Noise')
             wf.insert_node(bn, before=last.id)
             bn.parameters['selectedPolarisations'] = polarizations
@@ -911,11 +1039,7 @@ def pre(src, dst, workflow, allow_res_osv=True, osv_continue_on_fail=False,
         cal.parameters['outputBetaBand'] = output_beta0
         cal.parameters['outputSigmaBand'] = output_sigma0
         cal.parameters['outputGammaBand'] = output_gamma0
-        ############################################
-        tnr = parse_node('ThermalNoiseRemoval')
-        wf.insert_node(tnr, before=cal.id)
-        tnr.parameters['outputNoise'] = output_noise
-        last = tnr
+        last = cal
         ############################################
         if scene.product == 'SLC' and scene.acquisition_mode in ['EW', 'IW']:
             deb = parse_node('TOPSAR-Deburst')
