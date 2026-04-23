@@ -29,7 +29,7 @@ docs = ["sphinx", "sphinxcontrib-bibtex", "nbsphinx", "sphinx_rtd_theme", "sphin
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["s1ard"]
+include = ["s1ard", "s1ard.*"]
 
 [tool.setuptools.package-data]
 "s1ard" = ["resources/*"]
