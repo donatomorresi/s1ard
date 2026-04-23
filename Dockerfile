@@ -4,7 +4,13 @@
 FROM condaforge/miniforge3:25.11.0-0 AS conda-base
 
 # Installing prerequisites
-RUN apt update && \
+RUN if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
+        sed -i 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g; s|http://security.ubuntu.com|https://security.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources; \
+    fi && \
+    if [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g; s|http://security.ubuntu.com|https://security.ubuntu.com|g' /etc/apt/sources.list; \
+    fi && \
+    apt update && \
     apt upgrade -y && \
     apt install -y \
         git \

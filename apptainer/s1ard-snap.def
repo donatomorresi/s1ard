@@ -1,0 +1,90 @@
+Bootstrap: docker
+From: condaforge/miniforge3:25.11.0-0
+
+%arguments
+    UPDATE_SNAP=true
+
+%files
+    . /app
+
+%post -c /bin/bash
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+
+    if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
+        sed -i 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g; s|http://security.ubuntu.com|https://security.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources
+    fi
+    if [[ -f /etc/apt/sources.list ]]; then
+        sed -i 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g; s|http://security.ubuntu.com|https://security.ubuntu.com|g' /etc/apt/sources.list
+    fi
+
+    apt update
+    apt upgrade -y
+    apt install -y \
+        git \
+        wget \
+        fontconfig \
+        fonts-dejavu-core \
+        libxext-dev \
+        libxrender1 \
+        libxtst6 \
+        libxi6
+    fc-cache -f -v
+    apt clean
+    rm -rf /var/lib/apt/lists/*
+
+    conda env create --yes --file /app/environment.yaml
+    conda run -n s1ard python -m pip install /app/.
+    conda run -n s1ard conda install --yes duckdb
+    sed -i 's/conda activate base/conda activate s1ard/g' ~/.bashrc
+    echo "PATH=/opt/conda/envs/s1ard/bin:\$PATH" >> ~/.bashrc
+
+    SNAP_VERSION=13.0
+    TARGET_DIR=/opt/esa-snap
+    SNAP_UPDATE_MODULES="eu.esa.microwavetbx.microwavetbx.kit"
+    export JAVA_TOOL_OPTIONS=-Djava.awt.headless=true
+
+    cd /tmp
+    wget https://download.esa.int/step/snap/${SNAP_VERSION}/installers/esa-snap_sentinel_linux-${SNAP_VERSION}.0.sh
+    cp /app/docker/esa-snap.varfile /tmp/esa-snap.varfile
+    chmod +x /tmp/esa-snap_sentinel_linux-${SNAP_VERSION}.0.sh
+
+    /tmp/esa-snap_sentinel_linux-${SNAP_VERSION}.0.sh -q -varfile /tmp/esa-snap.varfile
+
+    SNAP_BIN="${TARGET_DIR}/bin/snap"
+    if [[ ! -x "${SNAP_BIN}" ]]; then
+        SNAP_BIN="$(command -v snap)"
+    fi
+    echo "Using SNAP executable: ${SNAP_BIN}"
+
+    if [[ "{{ UPDATE_SNAP }}" == "true" ]]; then
+        set +e
+        timeout 45m "${SNAP_BIN}" --nosplash --nogui --modules --update "${SNAP_UPDATE_MODULES}" 2>&1 | \
+        while read -r line; do \
+            echo "$line"; \
+            if [[ "$line" == *"updates=0"* ]]; then \
+                sleep 2; \
+                pkill -TERM -f "snap/jre/bin/java" || true; \
+                break; \
+            fi; \
+        done
+        rc=${PIPESTATUS[0]}
+        set -e
+        if [[ "${rc}" -ne 0 && "${rc}" -ne 143 ]]; then
+            echo "SNAP update failed with exit code ${rc}"
+            exit "${rc}"
+        fi
+    else
+        echo "Skipping SNAP module update (UPDATE_SNAP={{ UPDATE_SNAP }})"
+    fi
+
+%environment
+    export CONDA_DEFAULT_ENV=s1ard
+    export PROJ_DATA=/opt/conda/envs/s1ard/share/proj
+    export SNAP_VERSION=13.0
+    export TARGET_DIR=/opt/esa-snap
+    export JAVA_TOOL_OPTIONS=-Djava.awt.headless=true
+    export SNAP_UPDATE_MODULES=eu.esa.microwavetbx.microwavetbx.kit
+
+%runscript
+    exec "$@"

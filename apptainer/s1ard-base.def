@@ -1,0 +1,44 @@
+Bootstrap: docker
+From: condaforge/miniforge3:25.11.0-0
+
+%files
+    . /app
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+        sed -i 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g; s|http://security.ubuntu.com|https://security.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources
+    fi
+    if [ -f /etc/apt/sources.list ]; then
+        sed -i 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g; s|http://security.ubuntu.com|https://security.ubuntu.com|g' /etc/apt/sources.list
+    fi
+
+    apt update
+    apt upgrade -y
+    apt install -y \
+        git \
+        wget \
+        fontconfig \
+        fonts-dejavu-core \
+        libxext-dev \
+        libxrender1 \
+        libxtst6 \
+        libxi6
+    fc-cache -f -v
+    apt clean
+    rm -rf /var/lib/apt/lists/*
+
+    conda env create --yes --file /app/environment.yaml
+    conda run -n s1ard python -m pip install /app/.
+    conda run -n s1ard conda install --yes duckdb
+    sed -i 's/conda activate base/conda activate s1ard/g' ~/.bashrc
+    echo "PATH=/opt/conda/envs/s1ard/bin:\$PATH" >> ~/.bashrc
+
+%environment
+    export CONDA_DEFAULT_ENV=s1ard
+    export PROJ_DATA=/opt/conda/envs/s1ard/share/proj
+
+%runscript
+    exec "$@"
