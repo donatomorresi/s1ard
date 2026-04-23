@@ -27,6 +27,48 @@ import logging
 log = logging.getLogger('s1ard')
 
 
+def _is_mgrs_tile_id(tile_id: str) -> bool:
+    return re.match(r'^[0-9]{2}[A-Z]{3}$', str(tile_id)) is not None
+
+
+def _utm_zone_from_bbox_4326(meta: dict) -> int:
+    """
+    Estimate UTM zone from product bbox in EPSG:4326.
+    """
+    try:
+        bbox4326 = meta['prod']['geom_stac_bbox_4326']
+        lon_min = float(bbox4326[0])
+        lon_max = float(bbox4326[2])
+        lon_center = (lon_min + lon_max) / 2.0
+        zone = int((lon_center + 180.0) // 6.0) + 1
+        return max(1, min(60, zone))
+    except Exception:
+        # Conservative default for Europe if bbox is unavailable.
+        return 33
+
+
+def _latitude_band_from_bbox_4326(meta: dict) -> str:
+    """
+    Estimate MGRS latitude band from product bbox in EPSG:4326.
+    """
+    bands = "CDEFGHJKLMNPQRSTUVWX"
+    try:
+        bbox4326 = meta['prod']['geom_stac_bbox_4326']
+        lat_min = float(bbox4326[1])
+        lat_max = float(bbox4326[3])
+        lat_center = (lat_min + lat_max) / 2.0
+        if lat_center < -80.0:
+            return "C"
+        if lat_center >= 72.0:
+            return "X"
+        idx = int((lat_center + 80.0) // 8.0)
+        idx = max(0, min(len(bands) - 1, idx))
+        return bands[idx]
+    except Exception:
+        # Conservative default for central Europe.
+        return "N"
+
+
 def product_info(
         product_type: str,
         src_ids: list[ID],
@@ -35,7 +77,8 @@ def product_info(
         epsg: int,
         dir_ard: str,
         update: bool = False,
-        product_id: str | None = None
+        product_id: str | None = None,
+        polarizations: list[str] | None = None
 ) -> dict[str, str | int | datetime] | None:
     """
     Create initial ARD product metadata and create the product's target directory.
@@ -59,6 +102,9 @@ def product_info(
     product_id:
         an existing product ID. Default None: create a new one using
         function :func:`generate_unique_id`.
+    polarizations:
+        Optional polarization subset used for ARD generation, e.g. ['VV', 'VH'].
+        If None, source scene polarizations are used.
 
     Returns
     -------
@@ -79,7 +125,9 @@ def product_info(
         log.info('The determined acquisition time range is outside the valid range.')
         return None
     
-    pol_str = '_'.join(sorted(src_ids[0].polarizations))
+    if polarizations is None:
+        polarizations = src_ids[0].polarizations
+    pol_str = '_'.join(sorted([x.upper() for x in polarizations]))
     meta = {'mission': src_ids[0].sensor,
             'mode': src_ids[0].meta['acquisition_mode'],
             'product_type': product_type,
@@ -124,7 +172,8 @@ def product_info(
                 return product_info(product_type=product_type, src_ids=src_ids,
                                     tile_id=tile_id, extent=extent, epsg=epsg,
                                     dir_ard=dir_ard, update=update,
-                                    product_id=existing_meta['ID'])
+                                    product_id=existing_meta['ID'],
+                                    polarizations=polarizations)
             else:
                 return meta
     else:
@@ -147,6 +196,7 @@ def format(
         epsg: int,
         wbm: str | None = None,
         dem_type: str | None = None,
+        custom_dem_file: str | None = None,
         multithread: bool = True,
         compress: str | None = None,
         overviews: list[int] | None = None,
@@ -184,6 +234,9 @@ def format(
     dem_type:
         if defined, a DEM layer will be added to the product. The suffix `em` (elevation model) is used.
         Default `None`: do not add a DEM layer.
+    custom_dem_file:
+        Optional DEM file used for creating the `em` annotation on custom grids.
+        If defined, this is preferred over `dem_type`.
     multithread:
         Should `gdalwarp` use multithreading? Default is True. The number of threads used, can be adjusted in the
         `config.ini` file with the parameter `gdal_threads`.
@@ -345,22 +398,41 @@ def format(
     
     # create DEM (-em.tif)
     # (if not already converted from processor output)
-    if dem_type is not None and 'em' in allowed:
+    if (dem_type is not None or custom_dem_file is not None) and 'em' in allowed:
         em_path_base = prod_meta["file_base"].format(suffix='em')
         em_path = os.path.join(prod_meta['dir_ard_product'], 'annotation', em_path_base)
         if not os.path.isfile(em_path):
             log.info(f"creating {os.path.relpath(em_path, prod_meta['dir_ard_product'])}")
-            with Raster(ref_tif) as ras:
-                tr = ras.res
-            log_pyro = logging.getLogger('pyroSAR')
-            level = log_pyro.level
-            log_pyro.setLevel('NOTSET')
-            dem.to_mgrs(dem_type=dem_type, dst=em_path,
-                        overviews=overviews, tile=tile, tr=tr,
-                        create_options=write_options['em'],
-                        pbar=False)
-            log_pyro.setLevel(level)
-        ard_assets['em'] = em_path
+            if custom_dem_file is not None:
+                with Raster(ref_tif) as ras:
+                    xres, yres = ras.res
+                gdalwarp(src=custom_dem_file, dst=em_path,
+                         outputBounds=bounds, dstSRS=f'EPSG:{epsg}',
+                         xRes=xres, yRes=yres, targetAlignedPixels=True,
+                         resampleAlg='bilinear', format=driver,
+                         dstNodata=dst_nodata_float, multithread=multithread,
+                         creationOptions=write_options['em'])
+            else:
+                if _is_mgrs_tile_id(tile):
+                    with Raster(ref_tif) as ras:
+                        tr = ras.res
+                    log_pyro = logging.getLogger('pyroSAR')
+                    level = log_pyro.level
+                    log_pyro.setLevel('NOTSET')
+                    dem.to_mgrs(dem_type=dem_type, dst=em_path,
+                                overviews=overviews, tile=tile, tr=tr,
+                                create_options=write_options['em'],
+                                pbar=False)
+                    log_pyro.setLevel(level)
+                else:
+                    log.warning(
+                        f"annotation layer 'em' requested for non-MGRS tile '{tile}', "
+                        "but default DEM extraction requires MGRS tile IDs. "
+                        "Skipping 'em'. Set 'custom_dem_file' to enable DEM annotation "
+                        "for custom grids."
+                    )
+        if os.path.isfile(em_path):
+            ard_assets['em'] = em_path
     
     # create color composite VRT (-cc-[gs]-lin.vrt)
     if prod_meta['polarization'] in ['DH', 'DV'] and len(measure_tifs) == 2:
@@ -535,7 +607,21 @@ def append_metadata(
         xml.parse(meta=meta, target=prod_meta['dir_ard_product'],
                   assets=assets, exist_ok=True)
     if 'STAC' in config['metadata']['format']:
-        stac.parse(meta=meta, target=prod_meta['dir_ard_product'],
+        meta_stac = deepcopy(meta)
+        custom_grid = config['processing'].get('custom_tile_grid') is not None
+        mgrs_id = str(meta_stac['prod'].get('mgrsID', ''))
+        if custom_grid and not _is_mgrs_tile_id(mgrs_id):
+            zone = _utm_zone_from_bbox_4326(meta_stac)
+            lat_band = _latitude_band_from_bbox_4326(meta_stac)
+            pseudo_mgrs = f'{zone:02d}{lat_band}AA'
+            meta_stac['prod']['customTileID'] = mgrs_id
+            # cesard STAC writer expects mgrsID[:2] to be numeric UTM zone.
+            meta_stac['prod']['mgrsID'] = pseudo_mgrs
+            log.info(
+                f"custom tile id '{mgrs_id}' is not MGRS; using temporary "
+                f"STAC-compatible mgrsID '{pseudo_mgrs}' for STAC export"
+            )
+        stac.parse(meta=meta_stac, target=prod_meta['dir_ard_product'],
                    assets=assets, exist_ok=True)
 
 

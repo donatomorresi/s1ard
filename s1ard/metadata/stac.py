@@ -4,6 +4,7 @@ import sys
 import shutil
 import pystac
 from spatialist.ancillary import finder
+from s1ard.metadata.mapping import ARD_PATTERN
 import logging
 
 log = logging.getLogger('s1ard')
@@ -43,8 +44,8 @@ def make_catalog(directory, product_type, recursive=True, silent=False):
     """
     overwrite = False
     product_type = product_type.upper()
-    pattern = fr'^S1[AB]_(IW|EW|S[1-6])_{product_type}__1S(SH|SV|DH|DV|VV|HH|HV|VH)_[0-9]{{8}}T[0-9]{{6}}_[0-9]{{6}}_' \
-              fr'[0-9A-F]{{6}}_[0-9A-Z]{{5}}_[0-9A-Z]{{4}}$'
+    pattern = (fr'^S1[AB]_(IW|EW|S[1-6])_{product_type}__1S(SH|SV|DH|DV|VV|HH|HV|VH)_'
+               fr'[0-9]{{8}}T[0-9]{{6}}_[0-9]{{6}}_[0-9A-F]{{6}}_[0-9A-Za-z-]{{3,32}}_[0-9A-Z]{{4}}$')
     products = finder(target=directory, matchlist=[pattern], foldermode=2, regex=True, recursive=recursive)
     directory = os.path.join(directory, product_type)
     
@@ -66,8 +67,8 @@ def make_catalog(directory, product_type, recursive=True, silent=False):
     sp_extent = pystac.SpatialExtent([None, None, None, None])
     tmp_extent = pystac.TemporalExtent([None, None])
     
-    unique_tiles = list(
-        set([re.search(re.compile(r'_[0-9A-Z]{5}_'), prod).group().replace('_', '') for prod in products]))
+    unique_tiles = list(set([re.search(ARD_PATTERN, os.path.basename(prod)).groupdict()['mgrsID']
+                             for prod in products]))
     products = _reorganize_by_tile(directory=directory, product_type=product_type, products=products,
                                    recursive=recursive, silent=silent)
     
@@ -79,9 +80,9 @@ def make_catalog(directory, product_type, recursive=True, silent=False):
     for tile in unique_tiles:
         tile_collection = pystac.Collection(id=tile,
                                             description=f'STAC Collection of Sentinel-1 {product_type} products for '
-                                                        f'MGRS tile {tile}.',
+                                                        f'tile {tile}.',
                                             title=f'STAC Collection of Sentinel-1 {product_type} products for '
-                                                  f'MGRS tile {tile}.',
+                                                  f'tile {tile}.',
                                             extent=pystac.Extent(sp_extent, tmp_extent),
                                             keywords=['sar', 'backscatter', 'esa', 'copernicus', 'sentinel'],
                                             providers=[pystac.Provider(name='ESA',
@@ -139,17 +140,17 @@ def _reorganize_by_tile(directory, product_type, products=None, recursive=True, 
     """
     if products is None:
         parent_dir = os.path.dirname(directory)
-        pattern = fr'^S1[AB]_(IW|EW|S[1-6])_{product_type}__1S(SH|SV|DH|DV|VV|HH|HV|VH)_[0-9]{{8}}T[0-9]{{6}}_' \
-                  fr'[0-9]{{6}}_[0-9A-F]{{6}}_[0-9A-Z]{{5}}_[0-9A-Z]{{4}}$'
+        pattern = (fr'^S1[AB]_(IW|EW|S[1-6])_{product_type}__1S(SH|SV|DH|DV|VV|HH|HV|VH)_'
+                   fr'[0-9]{{8}}T[0-9]{{6}}_[0-9]{{6}}_[0-9A-F]{{6}}_[0-9A-Za-z-]{{3,32}}_[0-9A-Z]{{4}}$')
         products = finder(target=parent_dir, matchlist=[pattern], foldermode=2, regex=True, recursive=recursive)
     
     inp = input('WARNING:\n{}\nand the ARD products it contains will be reorganized into subdirectories '
-                'based on unique MGRS tile IDs if this directory structure does not yet exist. '
+                'based on unique tile IDs if this directory structure does not yet exist. '
                 '\nDo you wish to continue? [yes|no] '.format(directory))
     if inp == 'yes':
         tile_dict = {}
         for prod in products:
-            tile = re.search(re.compile(r'_[0-9A-Z]{5}_'), prod).group().replace('_', '')
+            tile = re.search(ARD_PATTERN, os.path.basename(prod)).groupdict()['mgrsID']
             if tile in tile_dict and isinstance(tile_dict[tile], list):
                 tile_dict[tile].append(prod)
             else:

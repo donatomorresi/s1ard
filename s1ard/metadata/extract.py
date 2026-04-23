@@ -548,7 +548,11 @@ def meta_dict(config, prod_meta, src_ids, compression):
     meta['common']['platformFullname'] = '{}{}'.format(meta['common']['platformShortName'].lower(),
                                                        meta['common']['platformIdentifier'].lower())
     meta['common']['platformReference'] = URL['platformReference'][meta['common']['platformFullname']]
-    meta['common']['polarisationChannels'] = sid0.polarizations
+    selected_pols = config['processing']['polarizations']
+    if selected_pols is not None:
+        meta['common']['polarisationChannels'] = [x.upper() for x in selected_pols]
+    else:
+        meta['common']['polarisationChannels'] = sid0.polarizations
     meta['common']['polarisationMode'] = prod_meta['polarization'][0]
     meta['common']['processingLevel'] = 'L1C'
     meta['common']['radarBand'] = 'C'
@@ -575,19 +579,31 @@ def meta_dict(config, prod_meta, src_ids, compression):
     meta['prod']['compression_zerrors'] = LERC_ERR_THRES
     meta['prod']['crsEPSG'] = str(prod_meta['epsg'])
     meta['prod']['crsWKT'] = prod_meta['wkt']
-    meta['prod']['demAccess'] = DEM_MAP[config['processing']['dem_type']]['access']
-    meta['prod']['demEGMReference'] = DEM_MAP[config['processing']['dem_type']]['egm']
+    custom_dem_file = config['processing']['custom_dem_file']
+    if config['processing']['dem_type'] == 'custom_dem' and custom_dem_file is not None:
+        dem_ref = DEM_MAP.get('Copernicus 30m Global DEM',
+                              {'egm': 'EGM2008', 'gsd': '10 m', 'type': 'elevation'})
+        meta['prod']['demAccess'] = os.path.abspath(custom_dem_file)
+        meta['prod']['demEGMReference'] = dem_ref['egm']
+        meta['prod']['demGSD'] = dem_ref['gsd']
+        meta['prod']['demName'] = os.path.basename(custom_dem_file)
+        meta['prod']['demReference'] = 'user-provided'
+        meta['prod']['demType'] = dem_ref['type']
+    else:
+        meta['prod']['demAccess'] = DEM_MAP[config['processing']['dem_type']]['access']
+        meta['prod']['demEGMReference'] = DEM_MAP[config['processing']['dem_type']]['egm']
+        meta['prod']['demGSD'] = DEM_MAP[config['processing']['dem_type']]['gsd']
+        meta['prod']['demName'] = config['processing']['dem_type'].replace(' II', '')
+        meta['prod']['demReference'] = DEM_MAP[config['processing']['dem_type']]['ref']
+        meta['prod']['demType'] = DEM_MAP[config['processing']['dem_type']]['type']
     meta['prod']['demEGMResamplingMethod'] = 'bilinear'
-    meta['prod']['demGSD'] = DEM_MAP[config['processing']['dem_type']]['gsd']
-    meta['prod']['demName'] = config['processing']['dem_type'].replace(' II', '')
-    meta['prod']['demReference'] = DEM_MAP[config['processing']['dem_type']]['ref']
     meta['prod']['demResamplingMethod'] = 'bilinear'
-    meta['prod']['demType'] = DEM_MAP[config['processing']['dem_type']]['type']
     meta['prod']['doi'] = config['metadata']['doi']
     meta['prod']['ellipsoidalHeight'] = None
     meta['prod']['equivalentNumberOfLooks'] = calc_enl(tif=ref_tif)
     
-    if (len(ei_tif) == 1 and
+    if (custom_dem_file is None and
+            len(ei_tif) == 1 and
             sid0.product == 'SLC' and
             'copernicus' in config['processing']['dem_type'].lower()):
         geo_corr_accuracy = calc_geolocation_accuracy(swath_identifier=op_mode,
@@ -614,8 +630,13 @@ def meta_dict(config, prod_meta, src_ids, compression):
     meta['prod']['geom_stac_geometry_4326'] = prod_meta['geom']['geometry']
     meta['prod']['geom_xml_center'] = prod_meta['geom']['center']
     meta['prod']['geom_xml_envelope'] = prod_meta['geom']['envelope']
-    meta['prod']['griddingConvention'] = 'Military Grid Reference System (MGRS)'
-    meta['prod']['griddingConventionURL'] = URL['griddingConventionURL']
+    custom_tile_grid = config['processing']['custom_tile_grid']
+    if custom_tile_grid is not None:
+        meta['prod']['griddingConvention'] = 'Custom Tile Grid'
+        meta['prod']['griddingConventionURL'] = custom_tile_grid
+    else:
+        meta['prod']['griddingConvention'] = 'Military Grid Reference System (MGRS)'
+        meta['prod']['griddingConventionURL'] = URL['griddingConventionURL']
     meta['prod']['licence'] = config['metadata']['licence']
     meta['prod']['mgrsID'] = prod_meta['tile']
     meta['prod']['noiseRemovalApplied'] = True
