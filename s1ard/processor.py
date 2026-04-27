@@ -398,7 +398,10 @@ def main(config_file=None, debug=False, **kwargs):
                     sig = inspect.signature(processor.process)
                     accepted_params = set(sig.parameters.keys())
                     proc_args = {k: v for k, v in proc_args.items() if k in accepted_params}
-                    processor.process(**proc_args)
+                    result = processor.process(**proc_args)
+                    if result is False:
+                        log.warning('scene produced no SAR outputs for the requested grid extent - skip')
+                        continue
                     t = round((time.time() - start_time), 2)
                     log.info(f'SAR processing finished in {t} seconds')
                 except Exception as e:

@@ -67,6 +67,19 @@ def _remove_lock_artifacts_by_prefix(folder, prefix):
     return removed
 
 
+def _is_empty_geocode_error(msg):
+    """
+    Identify SNAP geocoding failures caused by an empty subset / no overlap.
+    """
+    patterns = [
+        'No intersection with source product boundary',
+        '[NodeId: Terrain-Correction] Input should be a SAR product',
+        'Input should be a SAR product'
+    ]
+    return all(x in msg for x in ['Terrain-Correction', 'SAR product']) or \
+        any(x in msg for x in patterns)
+
+
 # main interface
 
 def config_to_string(config):
@@ -497,16 +510,26 @@ def process(scene, outdir, measurement, spacing, dem,
                         bands1.append('simulatedImage')
                     if 'lookDirection' in export_extra:
                         bands0.append('lookDirection')
-                    geo(*sources,
-                        dst=out_geo, workflow=out_geo_wf,
-                        spacing=spacing, crs=epsg, geometry=ext,
-                        export_extra=export_extra,
-                        standard_grid_origin_x=align_x,
-                        standard_grid_origin_y=align_y,
-                        bands0=bands0, bands1=bands1, dem=dem,
-                        dem_resampling_method=dem_resampling_method,
-                        img_resampling_method=img_resampling_method,
-                        gpt_args=gpt_args)
+                    try:
+                        geo(*sources,
+                            dst=out_geo, workflow=out_geo_wf,
+                            spacing=spacing, crs=epsg, geometry=ext,
+                            export_extra=export_extra,
+                            standard_grid_origin_x=align_x,
+                            standard_grid_origin_y=align_y,
+                            bands0=bands0, bands1=bands1, dem=dem,
+                            dem_resampling_method=dem_resampling_method,
+                            img_resampling_method=img_resampling_method,
+                            gpt_args=gpt_args)
+                    except RuntimeError as e:
+                        msg = str(e)
+                        if _is_empty_geocode_error(msg):
+                            log.warning(
+                                f'geocoding subset does not intersect the processed SAR product '
+                                f'for EPSG:{epsg} - skipping scene extent'
+                            )
+                            return False
+                        raise
                     log.info('edge cleaning')
                     postprocess(out_geo, clean_edges=clean_edges,
                                 clean_edges_pixels=clean_edges_pixels)
@@ -519,13 +542,17 @@ def process(scene, outdir, measurement, spacing, dem,
                     dm_vec = dm_ras.replace('.tif', '.gpkg')
                     dm_vec = datamask(measurement=measurements[0],
                                       dm_ras=dm_ras, dm_vec=dm_vec)
+                    return True
                 else:
                     log.info(f'geocoding to EPSG:{epsg} has already been performed')
+                    return True
         for wf in workflows:
             wf_dst = os.path.join(outdir_scene, os.path.basename(wf))
             if wf != wf_dst and not os.path.isfile(wf_dst):
                 shutil.copyfile(src=wf, dst=wf_dst)
+        return True
     
+    geocoded_any = False
     if geocode_target_epsg is not None:
         if geocode_target_extent is None:
             raise RuntimeError("geocode_target_extent must be set when geocode_target_epsg is used")
@@ -533,7 +560,7 @@ def process(scene, outdir, measurement, spacing, dem,
         epsg = geocode_target_epsg
         align_x = geocode_align_x if geocode_align_x is not None else ext['xmin']
         align_y = geocode_align_y if geocode_align_y is not None else ext['ymax']
-        run()
+        geocoded_any = run() or geocoded_any
     else:
         log.info('determining UTM zone overlaps')
         aois = aoi_from_scene(scene=id, multi=utm_multi)
@@ -542,7 +569,9 @@ def process(scene, outdir, measurement, spacing, dem,
             epsg = aoi['epsg']
             align_x = aoi['extent_utm']['xmin']
             align_y = aoi['extent_utm']['ymax']
-            run()
+            geocoded_any = run() or geocoded_any
+    if not geocoded_any:
+        log.warning('no SAR geocoded products were created for the requested extent - scene will be skipped')
     ############################################################################
     # delete intermediate files
     if cleanup:
@@ -569,6 +598,8 @@ def process(scene, outdir, measurement, spacing, dem,
             except FileNotFoundError:
                 # Temporary scene directory may already be gone.
                 pass
+    if not geocoded_any:
+        return False
 
 
 def translate_annotation(annotation, measurement):
