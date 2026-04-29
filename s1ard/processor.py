@@ -27,8 +27,6 @@ from s1ard.processors.registry import load_processor
 
 gdal.UseExceptions()
 
-
-
 def main(config_file=None, debug=False, **kwargs):
     """
     Main function that initiates and controls the processing workflow.
@@ -186,7 +184,8 @@ def main(config_file=None, debug=False, **kwargs):
                            'aoi_tiles', 'aoi_geometry', 'date_strict']
             dict_search = {k: config_proc[k] for k in attr_search}
             dict_search['acquisition_mode'] = config_proc['acq_mode']
-            dict_search['frameNumber'] = frame_number
+            if frame_number is not None:
+                dict_search['frameNumber'] = frame_number
             selection, aoi_tiles = scene_select(archive=archive,
                                                 **dict_search)
         
